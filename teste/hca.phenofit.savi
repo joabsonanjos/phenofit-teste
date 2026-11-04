@@ -1,0 +1,421 @@
+# ==============================================================================
+# ZONAS DE MANEJO (HCA) + FENOLOGIA POR ZONA  -  índice de vegetação: SAVI  (v2)
+# ==============================================================================
+# PRÉ-REQUISITO: rodar antes o data_input_v2.R na mesma sessão do R. Este script usa
+# os objetos: dados_ndvi, pesos_df, pixels_sf, roi_utm, pasta_saida e tamanho_pixel.
+#
+# Mudanças em relação ao hca_unificado.R:
+#  - exclusão automática de pixels de carreador/estrada ANTES do HCA, comparando a
+#    amplitude de cada pixel com a dos vizinhos (funciona mesmo com blocos de
+#    lavoura de níveis diferentes); mapa de conferência dos pixels excluídos
+#  - gráfico de fenologia por zona usa a série da própria zona (df_zona) ao fundo
+#  - lambda do Whittaker e argumentos extras do season() configuráveis no topo
+#  - INPUT, brks e série de cada zona guardados em diag_zonas (antes, depois do
+#    loop, os objetos eram só os da última zona)
+#  - lista de pixels excluídos exportada (xlsx e rds)
+#  - v3: curvas do gráfico de fenologia desenhadas uma linha por temporada (sem ligar
+#    o fim de uma temporada ao início da seguinte)
+# ==============================================================================
+
+# 1. BIBLIOTECAS ---------------------------------------------------------------
+library(sf)
+library(dplyr)
+library(tidyr)
+library(zoo)
+library(cluster)
+library(ggplot2)
+library(phenofit)
+library(writexl)
+
+# 2. CONFIGURAÇÃO --------------------------------------------------------------
+indice <- "SAVI"            # nome da coluna do índice no data frame dados_ndvi
+
+# Recorte temporal do HCA (a fenologia por zona usa todos os meses dos anos abaixo)
+ano_inicio <- 2020
+ano_fim    <- 2025
+mes_inicio <- 1             # se mes_inicio > mes_fim, o filtro vira o ano (ex.: 10 a 4)
+mes_fim    <- 12
+
+# Exclusão de não-lavoura (carreadores/estradas)
+razao_local <- 0.75         # exclui pixel com amplitude < 75% da mediana dos vizinhos
+# NULL desativa. CONFIRA o mapa Mapa_Pixels_Excluidos.png
+pixels_excluir_manual <- c()  # ids extras (pixel_id) para excluir à mão
+
+# HCA
+peso_min_pixel     <- 0.5   # só pixels com >= 50% da área dentro do talhão
+cobertura_min_data <- 0.8   # fração mínima de pixels observados para manter a data
+padronizar         <- TRUE  # TRUE: scale() por data (destaca o padrão espacial relativo)
+k_grupos           <- 3     # <--- número de zonas
+k_teste            <- 2:6   # valores de k avaliados pela silhueta
+
+# Fenologia por zona
+maxgap_dias        <- 90    # lacunas de até N dias serão preenchidas
+lambda_ph          <- 1     # suavização do Whittaker (NULL = padrão do phenofit)
+minpeakdistance_ph <- 60
+season_extra       <- list()  # argumentos extras do season(), ex.: list(ypeak_min = 0.2)
+metodo_ref         <- "Beck"
+trs_ref            <- "TRS2"          # TRS2 = limiar 20% | TRS5 = limiar 50%
+trs_limiares       <- c(0.2, 0.5)
+cobertura_min_zona <- 0.5   # fração mínima do peso da zona observada para manter a data
+
+# 3. CHECAGENS -----------------------------------------------------------------
+obj_necessarios <- c("dados_ndvi", "pesos_df", "pixels_sf", "roi_utm",
+                     "pasta_saida", "tamanho_pixel")
+faltando <- setdiff(obj_necessarios, ls(envir = .GlobalEnv))
+if (length(faltando) > 0) {
+  stop("Objetos ausentes: ", paste(faltando, collapse = ", "),
+       ". Rode o data_input_v2.R antes deste script.")
+}
+if (!indice %in% names(dados_ndvi)) {
+  stop("Coluna '", indice, "' não encontrada em dados_ndvi. Colunas: ",
+       paste(names(dados_ndvi), collapse = ", "))
+}
+
+mes_ok <- function(m) {
+  if (mes_inicio <= mes_fim) m >= mes_inicio & m <= mes_fim else m >= mes_inicio | m <= mes_fim
+}
+
+tema_base <- theme_minimal(base_family = "serif") +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold", size = 14),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.ticks   = element_line(color = "black")
+  )
+
+# 4. BASE DIÁRIA POR PIXEL (UMA VEZ) -------------------------------------------
+# Recorta os anos, resolve duplicatas (pixel/dia) e remove NA/NaN.
+base_diaria <- dados_ndvi %>%
+  transmute(pixel_id, Data = as.Date(Data), VI = .data[[indice]]) %>%
+  filter(as.integer(format(Data, "%Y")) >= ano_inicio,
+         as.integer(format(Data, "%Y")) <= ano_fim) %>%
+  group_by(pixel_id, Data) %>%
+  summarise(VI = mean(VI, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(VI))
+
+# 5. PREPARAÇÃO DA MATRIZ PARA O HCA -------------------------------------------
+pixels_hca <- pesos_df %>% filter(peso >= peso_min_pixel) %>% pull(pixel_id)
+
+dados_hca_base <- base_diaria %>%
+  filter(pixel_id %in% pixels_hca,
+         mes_ok(as.integer(format(Data, "%m"))))
+
+# Mantém apenas datas com cobertura suficiente de pixels observados
+datas_ok <- dados_hca_base %>%
+  count(Data) %>%
+  mutate(cobertura = n / length(pixels_hca)) %>%
+  filter(cobertura >= cobertura_min_data) %>%
+  pull(Data)
+
+if (length(datas_ok) < 3) {
+  stop("Poucas datas com cobertura >= ", cobertura_min_data,
+       ". Reduza cobertura_min_data ou amplie o período.")
+}
+message(sprintf("HCA: %d pixels candidatos | %d datas mantidas.",
+                length(pixels_hca), length(datas_ok)))
+
+interpolar <- function(y, x) {
+  if (sum(!is.na(y)) < 2) return(y)
+  zoo::na.approx(y, x = x, na.rm = FALSE, rule = 2)
+}
+
+dados_imputados <- dados_hca_base %>%
+  filter(Data %in% datas_ok) %>%
+  complete(pixel_id = pixels_hca, Data = datas_ok) %>%   # grade pixel x data completa
+  arrange(pixel_id, Data) %>%
+  group_by(pixel_id) %>%
+  mutate(VI = interpolar(VI, Data)) %>%
+  ungroup()
+
+# 5b. EXCLUSÃO DE NÃO-LAVOURA (carreadores/estradas) ---------------------------
+# Critério: amplitude (P95 - P05) do pixel muito menor que a mediana dos vizinhos.
+pixels_excluir <- pixels_excluir_manual
+
+pix_diag <- pixels_sf %>% filter(pixel_id %in% pixels_hca)
+
+if (!is.null(razao_local)) {
+  stats_pixel <- dados_imputados %>%
+    group_by(pixel_id) %>%
+    summarise(amplitude = quantile(VI, 0.95, na.rm = TRUE) - quantile(VI, 0.05, na.rm = TRUE),
+              .groups = "drop")
+  
+  pix_diag <- pix_diag %>% left_join(stats_pixel, by = "pixel_id")
+  cent <- st_centroid(st_geometry(pix_diag))
+  viz  <- st_is_within_distance(cent, cent, dist = tamanho_pixel * 1.5)  # até 8 vizinhos
+  
+  amp <- pix_diag$amplitude
+  amp_viz <- vapply(seq_along(viz), function(i) {
+    v <- setdiff(viz[[i]], i)
+    if (length(v) < 3) NA_real_ else median(amp[v], na.rm = TRUE)
+  }, numeric(1))
+  
+  pix_diag$razao <- amp / amp_viz
+  pixels_excluir <- union(
+    pixels_excluir,
+    pix_diag$pixel_id[!is.na(pix_diag$razao) & pix_diag$razao < razao_local]
+  )
+}
+
+pixels_excluir <- as.integer(pixels_excluir)
+message(sprintf("%d de %d pixel(s) excluído(s) como não-lavoura.",
+                length(pixels_excluir), length(pixels_hca)))
+
+# Mapa de conferência: vermelho = excluído
+pix_diag$excluido <- pix_diag$pixel_id %in% pixels_excluir
+mapa_excl <- ggplot(pix_diag) +
+  geom_sf(aes(fill = excluido), color = NA) +
+  geom_sf(data = roi_utm, fill = NA, color = "black", linewidth = 1) +
+  scale_fill_manual(values = c("FALSE" = "grey80", "TRUE" = "red"), name = "Excluído") +
+  tema_base +
+  theme(panel.grid = element_blank()) +
+  labs(title = "Pixels excluídos como não-lavoura", x = "Longitude", y = "Latitude")
+print(mapa_excl)
+ggsave(file.path(pasta_saida, "Mapa_Pixels_Excluidos.png"),
+       plot = mapa_excl, width = 8, height = 7, dpi = 300, bg = "white")
+
+dados_imputados <- dados_imputados %>% filter(!pixel_id %in% pixels_excluir)
+if (nrow(dados_imputados) == 0) stop("Todos os pixels foram excluídos. Aumente razao_local.")
+
+# 5c. MATRIZ LARGA -------------------------------------------------------------
+matriz_larga <- dados_imputados %>%
+  pivot_wider(names_from = Data, values_from = VI)
+
+# Pixels que ainda tenham NA (sem observações suficientes) saem do HCA
+n_antes <- nrow(matriz_larga)
+matriz_larga <- matriz_larga[complete.cases(matriz_larga), ]
+if (nrow(matriz_larga) < n_antes) {
+  message(sprintf("%d pixel(s) removido(s) por falta de observações.",
+                  n_antes - nrow(matriz_larga)))
+}
+
+mat <- as.matrix(matriz_larga[, -1])
+rownames(mat) <- matriz_larga$pixel_id
+
+# 6. HCA -----------------------------------------------------------------------
+if (padronizar) {
+  mat <- mat[, apply(mat, 2, sd) > 0, drop = FALSE]   # scale() quebra com variância zero
+  dados_cluster <- scale(mat)
+} else {
+  dados_cluster <- mat
+}
+
+matriz_distancia <- dist(dados_cluster, method = "euclidean")
+modelo_hca       <- hclust(matriz_distancia, method = "ward.D2")
+
+# Silhueta média por k (apoio à escolha; maior = grupos mais bem separados)
+k_teste <- k_teste[k_teste < nrow(mat)]
+silhueta_df <- tibble(
+  k = k_teste,
+  silhueta_media = sapply(k_teste, function(k) {
+    mean(cluster::silhouette(cutree(modelo_hca, k = k), matriz_distancia)[, "sil_width"])
+  })
+)
+print(silhueta_df)
+
+grupos_df <- tibble(
+  pixel_id = as.integer(rownames(mat)),
+  Grupo    = factor(cutree(modelo_hca, k = k_grupos))
+)
+
+# 7. MAPA DAS ZONAS ------------------------------------------------------------
+mapa_hca_sf <- pixels_sf %>% inner_join(grupos_df, by = "pixel_id")
+
+mapa_zonas <- ggplot() +
+  geom_sf(data = mapa_hca_sf, aes(fill = Grupo), color = NA, alpha = 0.9) +
+  geom_sf(data = roi_utm, fill = NA, color = "black", linewidth = 1) +
+  scale_fill_brewer(palette = "Set1", name = "Zona de Manejo") +
+  tema_base +
+  theme(legend.position = "right", panel.grid = element_blank()) +
+  labs(
+    title = paste0("Zonas de Manejo HCA (", indice, ") - Meses ", mes_inicio, " a ", mes_fim,
+                   " (k = ", k_grupos, ")"),
+    x = "Longitude", y = "Latitude"
+  )
+
+print(mapa_zonas)
+ggsave(file.path(pasta_saida, "Mapa_Zonas_HCA.png"),
+       plot = mapa_zonas, width = 8, height = 7, dpi = 300, bg = "white")
+
+# 8. SÉRIE DO ÍNDICE POR ZONA (dados do HCA, já interpolados) ------------------
+resumo_zonas <- dados_imputados %>%
+  inner_join(grupos_df, by = "pixel_id") %>%
+  group_by(Grupo, Data) %>%
+  summarise(VI_Medio = mean(VI), .groups = "drop")
+
+grafico_serie_zonas <- ggplot(resumo_zonas, aes(x = Data, y = VI_Medio, color = Grupo)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5, alpha = 0.8) +
+  scale_color_brewer(palette = "Set1", name = "Zona de Manejo") +
+  tema_base +
+  theme(legend.position = "bottom", legend.title = element_text(face = "bold")) +
+  labs(
+    title = paste0("Dinâmica Temporal do ", indice, " por Zona - Meses ", mes_inicio, " a ", mes_fim),
+    x = "Data", y = paste(indice, "médio")
+  )
+
+print(grafico_serie_zonas)
+ggsave(file.path(pasta_saida, "Grafico_Serie_Temporal_Zonas.png"),
+       plot = grafico_serie_zonas, width = 10, height = 5, dpi = 300, bg = "white")
+
+# 9. SÉRIE PONDERADA POR ZONA (todos os meses) PARA O PHENOFIT -----------------
+# Só entram pixels que estão em grupos_df (ou seja, sem os excluídos).
+peso_zona <- pesos_df %>%
+  inner_join(grupos_df, by = "pixel_id") %>%
+  group_by(Grupo) %>%
+  summarise(peso_zona = sum(peso), .groups = "drop")
+
+serie_zonas <- base_diaria %>%
+  inner_join(pesos_df, by = "pixel_id") %>%
+  inner_join(grupos_df, by = "pixel_id") %>%
+  group_by(Grupo, Data) %>%
+  summarise(VI_Medio = sum(VI * peso) / sum(peso), peso_obs = sum(peso), .groups = "drop") %>%
+  left_join(peso_zona, by = "Grupo") %>%
+  mutate(cobertura = peso_obs / peso_zona) %>%
+  filter(cobertura >= cobertura_min_zona) %>%
+  arrange(Grupo, Data)
+
+# 10. FENOLOGIA POR ZONA -------------------------------------------------------
+resultado_vazio <- function(zona, status) {
+  data.frame(
+    Zona_Manejo = paste("Zona", zona), Ciclo = NA_integer_,
+    Inicio_Temporada_SOS = as.Date(NA), Fim_Temporada_EOS = as.Date(NA),
+    Duracao_Dias = NA_real_, Status = status
+  )
+}
+
+grafico_erro <- function(zona, mensagem) {
+  p <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5, label = mensagem, size = 6,
+             color = "darkred", fontface = "bold") +
+    theme_void(base_family = "serif") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+          panel.border = element_rect(color = "black", fill = NA, linewidth = 1)) +
+    labs(title = paste("Fenologia - Zona", zona))
+  ggsave(file.path(pasta_saida, paste0("Grafico_Fenologia_Zona_", zona, ".png")),
+         plot = p, width = 10, height = 5, dpi = 300, bg = "white")
+}
+
+lista_fases_zonas <- list()
+diag_zonas <- list()   # diag_zonas[["1"]]$INPUT, $brks, $serie, para inspecionar cada zona
+
+for (g in levels(grupos_df$Grupo)) {
+  cat("\nProcessando Zona:", g, "...\n")
+  
+  df_zona <- serie_zonas %>%
+    filter(Grupo == g) %>%
+    transmute(t = Data, y = VI_Medio) %>%
+    arrange(t)
+  
+  lista_fases_zonas[[g]] <- tryCatch({
+    
+    if (nrow(df_zona) < 10) stop("série com menos de 10 datas válidas")
+    
+    passo_dias <- median(as.numeric(diff(df_zona$t)))
+    nptperyear <- ceiling(365 / passo_dias)
+    maxgap_pts <- max(1, ceiling(maxgap_dias / passo_dias))   # maxgap é em PONTOS
+    
+    INPUT <- check_input(t = df_zona$t, y = df_zona$y, w = rep(1, nrow(df_zona)),
+                         nptperyear = nptperyear, maxgap = maxgap_pts)
+    
+    args_season <- c(
+      list(INPUT = INPUT, rFUN = smooth_wWHIT, wFUN = wTSM,
+           minpeakdistance = minpeakdistance_ph, iters = 2, IsPlot = FALSE),
+      if (!is.null(lambda_ph)) list(lambda = lambda_ph),
+      season_extra
+    )
+    brks <- do.call(season, args_season)
+    
+    diag_zonas[[g]] <- list(INPUT = INPUT, brks = brks, serie = df_zona)
+    
+    sem_temporada <- is.null(brks) || length(brks) == 0 ||
+      (!is.null(brks$dt) && nrow(brks$dt) == 0)
+    
+    if (sem_temporada) {
+      cat(" -> STATUS: nenhuma temporada identificada.\n")
+      grafico_erro(g, paste("Nenhuma temporada identificada\nna Zona", g))
+      resultado_vazio(g, "Nenhuma temporada identificada")
+    } else {
+      fits  <- curvefits(INPUT, brks,
+                         options = list(methods = c("AG", "Beck", "Elmore", "Zhang"),
+                                        wFUN = wTSM, iters = 2))
+      pheno <- get_pheno(fits, TRS = trs_limiares, IsPlot = FALSE)
+      
+      datas_metodo <- as.data.frame(pheno$date[[metodo_ref]])
+      col_sos <- paste0(trs_ref, ".sos")
+      col_eos <- paste0(trs_ref, ".eos")
+      if (!all(c(col_sos, col_eos) %in% names(datas_metodo))) {
+        stop("colunas ", col_sos, "/", col_eos, " ausentes. Disponíveis: ",
+             paste(names(datas_metodo), collapse = ", "))
+      }
+      
+      datas_sos <- as.Date(datas_metodo[[col_sos]])
+      datas_eos <- as.Date(datas_metodo[[col_eos]])
+      
+      df_fits <- get_fitting(fits)
+      
+      # Identifica a temporada de cada ponto ajustado, para desenhar uma linha por
+      # temporada (sem ligar o fim de uma ao início da seguinte pelos intervalos sem ajuste)
+      if ("flag" %in% names(df_fits)) {
+        df_fits$trecho <- as.character(df_fits$flag)
+      } else {
+        temporadas <- brks$dt
+        df_fits$trecho <- vapply(df_fits$t, function(x) {
+          i <- which(x >= temporadas$beg & x <= temporadas$end)
+          if (length(i) == 0) NA_integer_ else i[1]
+        }, integer(1))
+        df_fits <- df_fits[!is.na(df_fits$trecho), ]
+      }
+      
+      grafico_zona <- ggplot(df_fits) +
+        geom_point(data = df_zona, aes(x = t, y = y),      # série bruta da zona
+                   color = "gray60", alpha = 0.5, size = 1.5) +
+        geom_line(aes(x = t, y = ziter2, color = meth,
+                      group = interaction(meth, trecho)), linewidth = 1) +
+        geom_vline(xintercept = na.omit(datas_sos), color = "darkgreen",
+                   linetype = "dashed", linewidth = 0.8) +
+        geom_vline(xintercept = na.omit(datas_eos), color = "red",
+                   linetype = "dashed", linewidth = 0.8) +
+        tema_base +
+        theme(legend.position = "bottom", legend.title = element_text(face = "bold")) +
+        labs(title = paste("Fenologia - Zona", g),
+             subtitle = paste0("Verde: início (SOS) | Vermelho: fim (EOS) | Ref.: ",
+                               metodo_ref, " ", trs_ref),
+             x = "Data", y = indice, color = "Modelo")
+      
+      print(grafico_zona)
+      ggsave(file.path(pasta_saida, paste0("Grafico_Fenologia_Zona_", g, ".png")),
+             plot = grafico_zona, width = 10, height = 5, dpi = 300, bg = "white")
+      cat(" -> STATUS: concluído.\n")
+      
+      data.frame(
+        Zona_Manejo = paste("Zona", g),
+        Ciclo = seq_along(datas_sos),
+        Inicio_Temporada_SOS = datas_sos,
+        Fim_Temporada_EOS = datas_eos,
+        Duracao_Dias = as.numeric(datas_eos - datas_sos),
+        Status = "Temporada identificada"
+      )
+    }
+    
+  }, error = function(e) {
+    cat(" -> STATUS: erro:", conditionMessage(e), "\n")
+    grafico_erro(g, paste("Erro no processamento\nda Zona", g))
+    resultado_vazio(g, paste("Erro:", conditionMessage(e)))
+  })
+}
+
+# 11. EXPORTAR -----------------------------------------------------------------
+write_xlsx(
+  list(
+    Fases_Zonas      = bind_rows(lista_fases_zonas),
+    Pixel_Zona       = grupos_df,
+    Silhueta_k       = silhueta_df,
+    Serie_Zonas      = serie_zonas,
+    Pixels_Excluidos = tibble(pixel_id = pixels_excluir)
+  ),
+  file.path(pasta_saida, "Resultados_HCA_Zonas.xlsx")
+)
+saveRDS(pixels_excluir, file.path(pasta_saida, "pixels_excluir.rds"))
+
+# Para inspecionar uma zona depois (ex.: Zona 2):
+#   plot_season(diag_zonas[["2"]]$INPUT, diag_zonas[["2"]]$brks)
+#   diag_zonas[["2"]]$brks$dt
