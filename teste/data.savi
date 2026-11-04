@@ -1,0 +1,239 @@
+# ==============================================================================
+# SAVI PONDERADO PELA ÁREA DO TALHÃO + FENOLOGIA (phenofit)  -  versão 2
+# ==============================================================================
+# Principais mudanças em relação à versão anterior:
+#  - bibliotecas e parâmetros centralizados no topo
+#  - ROI dissolvido (st_union) e validado (st_make_valid): evita pixels duplicados
+#  - área do pixel calculada (não fixada em 900 m²)
+#  - coordenadas arredondadas antes de gerar o pixel_id (evita falha de join em float)
+#  - NA/NaN removidos ANTES da média ponderada (corrige viés no denominador)
+#  - cobertura espacial por data + filtro de cobertura mínima
+#  - maxgap do phenofit convertido de dias para número de pontos
+#  - extração de SOS/EOS por método e limiar escolhidos explicitamente
+#  - colunas renomeadas: SOS/EOS = início/fim da temporada (proxy), não plantio/colheita
+# ==============================================================================
+
+# 1. BIBLIOTECAS ---------------------------------------------------------------
+library(sf)
+library(dplyr)
+library(readr)
+library(writexl)
+library(ggplot2)
+library(phenofit)
+
+# 2. CONFIGURAÇÃO -------------------------------------------------------------
+
+epsg_utm        <- 31984   # SIRGAS 2000 / UTM 24S (use 31985 para UTM 25S, leste de PE)
+tamanho_pixel   <- 30      # metros (Landsat). Ajuste se os dados não forem Landsat
+casas_coord     <- 6       # arredondamento das coordenadas para gerar o pixel_id
+cobertura_min   <- 0.5     # fração mínima do talhão com SAVI válido para manter a data
+
+# phenofit
+maxgap_dias     <- 30      # lacunas de até N dias serão preenchidas
+metodo_ref      <- "Beck"  # método usado nas datas e no gráfico
+trs_ref         <- "TRS2"  # TRS2 = limiar 20% | TRS5 = limiar 50% (ver TRS abaixo)
+trs_limiares    <- c(0.2, 0.5)
+
+dir.create(pasta_saida, showWarnings = FALSE, recursive = TRUE)
+
+# 3. LER DADOS E ROI -----------------------------------------------------------
+dados_SAVI <- read_csv(caminho_csv, show_col_types = FALSE) %>%
+  mutate(
+    Data      = as.Date(Data),
+    longitude = round(longitude, casas_coord),
+    latitude  = round(latitude,  casas_coord)
+  )
+
+roi_utm <- st_read(caminho_roi, quiet = TRUE) %>%
+  st_make_valid() %>%
+  st_transform(epsg_utm) %>%
+  st_union() %>%          # dissolve em uma única geometria
+  st_sf(geometry = .)
+
+# 4. PIXELS: ID ÚNICO E RECONSTRUÇÃO DA GEOMETRIA ------------------------------
+coords_unicas <- dados_SAVI %>%
+  distinct(longitude, latitude) %>%
+  mutate(pixel_id = row_number())
+
+dados_SAVI <- dados_SAVI %>%
+  left_join(coords_unicas, by = c("longitude", "latitude"))
+
+# Assume que a coordenada é o centro do pixel
+pixels_sf <- st_as_sf(coords_unicas, coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(epsg_utm) %>%
+  st_buffer(dist = tamanho_pixel / 2, endCapStyle = "SQUARE")
+
+pixels_sf$area_pixel <- as.numeric(st_area(pixels_sf))
+
+# 5. INTERSECÇÃO E PESOS -------------------------------------------------------
+interseccao <- suppressWarnings(st_intersection(pixels_sf, roi_utm))
+interseccao$area_interna <- as.numeric(st_area(interseccao))
+
+pesos_df <- interseccao %>%
+  st_drop_geometry() %>%
+  group_by(pixel_id) %>%                       # segurança contra linhas repetidas
+  summarise(
+    area_interna = sum(area_interna),
+    area_pixel   = first(area_pixel),
+    .groups = "drop"
+  ) %>%
+  mutate(peso = area_interna / area_pixel)
+
+peso_total <- sum(pesos_df$peso)
+
+# 6. SÉRIE TEMPORAL PONDERADA --------------------------------------------------
+serie_completa <- dados_SAVI %>%
+  # 1) resolve duplicatas do satélite (média do pixel no dia)
+  group_by(pixel_id, Data) %>%
+  summarise(SAVI = mean(SAVI, na.rm = TRUE), .groups = "drop") %>%
+  # 2) remove NA/NaN antes de ponderar (is.na() também captura NaN)
+  filter(!is.na(SAVI)) %>%
+  # 3) junta pesos e calcula a média do talhão
+  inner_join(pesos_df, by = "pixel_id") %>%
+  group_by(Data) %>%
+  summarise(
+    SAVI_Medio_Ponderado = round(sum(SAVI * peso) / sum(peso), 4),
+    n_pixels             = n(),
+    cobertura            = round(sum(peso) / peso_total, 3),
+    .groups = "drop"
+  ) %>%
+  arrange(Data)
+
+serie_ponderada <- serie_completa %>%
+  filter(cobertura >= cobertura_min)
+
+message(sprintf("Datas mantidas: %d de %d (cobertura mínima = %.0f%%)",
+                nrow(serie_ponderada), nrow(serie_completa), cobertura_min * 100))
+
+# 7. EXPORTAR SÉRIE ------------------------------------------------------------
+write_xlsx(
+  list(
+    Serie_Filtrada = serie_ponderada,
+    Serie_Completa = serie_completa   # inclui datas com baixa cobertura, para conferência
+  ),
+  file.path(pasta_saida, "Serie_Temporal_SAVI_Ponderada.xlsx")
+)
+
+# 8. MAPA DE VALIDAÇÃO DOS PIXELS ----------------------------------------------
+pixels_mapa <- pixels_sf %>%
+  inner_join(select(pesos_df, pixel_id, peso), by = "pixel_id") %>%
+  mutate(Percentual = round(peso * 100, 2))
+
+mapa_ggplot <- ggplot() +
+  geom_sf(data = pixels_mapa, aes(fill = Percentual), color = NA, alpha = 0.9) +
+  geom_sf(data = roi_utm, fill = NA, color = "red", linewidth = 1) +
+  scale_fill_distiller(palette = "Blues", direction = 1, na.value = NA,
+                       name = "Área \nInterna (%)") +
+  theme_minimal(base_family = "serif") +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text  = element_text(size = 10),
+    plot.title   = element_text(hjust = 0.5, face = "bold", size = 14),
+    panel.grid   = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+    axis.ticks   = element_line(color = "black")
+  ) +
+  labs(
+    title = "Peso Espacial (% da área) dos Pixels - Landsat vs Talhão",
+    x = "Longitude", y = "Latitude"
+  )
+
+ggsave(file.path(pasta_saida, "Mapa_Identificacao_Pixels.png"),
+       plot = mapa_ggplot, width = 8, height = 7, dpi = 300, bg = "white")
+
+# 9. FENOLOGIA (phenofit) ------------------------------------------------------
+df_pheno <- serie_ponderada %>%
+  transmute(t = Data, y = SAVI_Medio_Ponderado) %>%
+  filter(!is.na(y)) %>%
+  arrange(t)
+
+# Resolução temporal média da série e conversão de dias -> número de pontos
+passo_dias  <- median(as.numeric(diff(df_pheno$t)))
+nptperyear  <- ceiling(365 / passo_dias)
+maxgap_pts  <- max(1, ceiling(maxgap_dias / passo_dias))
+
+# Pesos de qualidade: sem banda QA, todos iguais a 1.
+# Se puder, exporte o QA do Earth Engine e use pesos menores para pixels suspeitos.
+INPUT <- check_input(
+  t = df_pheno$t,
+  y = df_pheno$y,
+  w = rep(1, nrow(df_pheno)),
+  nptperyear = nptperyear,
+  maxgap = maxgap_pts      # em PONTOS (confira ?check_input na sua versão)
+)
+
+brks <- season(
+  INPUT,
+  rFUN = smooth_wWHIT,
+  wFUN = wTSM,
+  minpeakdistance = 150,   # ajuste conforme o ciclo da cultura
+  iters = 2,
+  IsPlot = FALSE
+)
+
+fits <- curvefits(
+  INPUT, brks,
+  options = list(
+    methods = c("AG", "Beck", "Elmore", "Zhang"),
+    wFUN = wTSM,
+    iters = 2
+  )
+)
+
+pheno_metrics <- get_pheno(fits, TRS = trs_limiares, IsPlot = FALSE)
+
+# Exporta todas as métricas, uma linha por método/temporada
+pheno_df <- bind_rows(pheno_metrics$date, .id = "Metodo_Ajuste")
+write_xlsx(pheno_df, file.path(pasta_saida, "Metricas_Fenologicas_Phenofit.xlsx"))
+
+# 10. TABELA DE INÍCIO/FIM DE TEMPORADA ----------------------------------------
+# SOS/EOS são proxies (início da rebrota e senescência na curva de SAVI),
+# não datas agronômicas de plantio e colheita.
+datas_metodo <- as.data.frame(pheno_metrics$date[[metodo_ref]])
+col_sos <- paste0(trs_ref, ".sos")
+col_eos <- paste0(trs_ref, ".eos")
+
+if (!all(c(col_sos, col_eos) %in% names(datas_metodo))) {
+  stop("Colunas '", col_sos, "' / '", col_eos, "' não encontradas. Colunas disponíveis: ",
+       paste(names(datas_metodo), collapse = ", "))
+}
+
+tabela_fases <- tibble(
+  Ciclo                = seq_len(nrow(datas_metodo)),
+  Inicio_Temporada_SOS = as.Date(datas_metodo[[col_sos]]),
+  Fim_Temporada_EOS    = as.Date(datas_metodo[[col_eos]])
+) %>%
+  mutate(Duracao_Dias = as.numeric(Fim_Temporada_EOS - Inicio_Temporada_SOS))
+
+print(tabela_fases)
+write_xlsx(tabela_fases, file.path(pasta_saida, "Datas_Inicio_Fim_Temporada.xlsx"))
+
+# 11. GRÁFICO ------------------------------------------------------------------
+df_fits <- get_fitting(fits)
+
+grafico_pheno <- ggplot(df_fits) +
+  geom_point(data = subset(df_fits, meth == metodo_ref), aes(x = t, y = y),
+             color = "gray60", alpha = 0.5, size = 1.5) +
+  geom_line(aes(x = t, y = ziter2, color = meth), linewidth = 1) +
+  geom_vline(xintercept = na.omit(tabela_fases$Inicio_Temporada_SOS),
+             color = "darkgreen", linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = na.omit(tabela_fases$Fim_Temporada_EOS),
+             color = "red", linetype = "dashed", linewidth = 0.8) +
+  theme_minimal(base_family = "serif") +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    plot.title   = element_text(hjust = 0.5, face = "bold", size = 14),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 1)
+  ) +
+  labs(
+    title = "Série Temporal de SAVI - Início e Fim de Temporada",
+    subtitle = paste0("Verde: início (SOS) | Vermelho: fim (EOS) | Ref.: ",
+                      metodo_ref, " ", trs_ref),
+    x = "Data", y = "SAVI", color = "Algoritmo de Suavização"
+  )
+
+print(grafico_pheno)
+ggsave(file.path(pasta_saida, "Grafico_Fenologia_Com_Fases.png"),
+       plot = grafico_pheno, width = 10, height = 5, dpi = 300, bg = "white")
